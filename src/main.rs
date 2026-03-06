@@ -61,6 +61,18 @@ struct RefRecord {
     seq: Vec<u8>,
 }
 
+struct BuildResult64 {
+    table: Vec<NoHashMap64<GeneSet>>,
+    malformed_headers: u64,
+    total_headers: u64,
+}
+
+struct BuildResult32 {
+    table: Vec<NoHashMap32<GeneSet>>,
+    malformed_headers: u64,
+    total_headers: u64,
+}
+
 struct QueryStats {
     hits: u64,
     multi_gene_hits: u64,
@@ -178,26 +190,30 @@ fn main() -> io::Result<()> {
     }
 
     if args.hash32 {
-        let table = build_table32(
+        let build = build_table32(
             &args.reference,
             Arc::clone(&masks),
             args.shards,
             shard_bits,
             threads,
         )?;
+        print_header_parse_stats(build.malformed_headers, build.total_headers);
+        let table = build.table;
         let (multi_kmers, total_kmers) = indexed_gene_stats32(&table);
         print_indexed_gene_stats(multi_kmers, total_kmers);
         let table = Arc::new(table);
         let stats = query_table32(&args.query, table, masks, shard_bits, threads)?;
         print_query_stats(&stats);
     } else {
-        let table = build_table64(
+        let build = build_table64(
             &args.reference,
             Arc::clone(&masks),
             args.shards,
             shard_bits,
             threads,
         )?;
+        print_header_parse_stats(build.malformed_headers, build.total_headers);
+        let table = build.table;
         let (multi_kmers, total_kmers) = indexed_gene_stats64(&table);
         print_indexed_gene_stats(multi_kmers, total_kmers);
         let table = Arc::new(table);
@@ -214,7 +230,7 @@ fn build_table64(
     shards: usize,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<Vec<NoHashMap64<GeneSet>>> {
+) -> io::Result<BuildResult64> {
     let (tx, rx) = bounded::<RefRecord>(threads * 4);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -225,10 +241,16 @@ fn build_table64(
     }
     drop(rx);
 
+    let mut malformed_headers = 0u64;
+    let mut total_headers = 0u64;
     read_fasta_records(path, |header, seq| {
         if !seq.is_empty() {
-            let gene_hash = parse_gene_hash(&header)?;
-            let _ = tx.send(RefRecord { gene_hash, seq });
+            total_headers += 1;
+            if let Some(gene_hash) = parse_gene_hash(&header) {
+                let _ = tx.send(RefRecord { gene_hash, seq });
+            } else {
+                malformed_headers += 1;
+            }
         }
         Ok(())
     })?;
@@ -239,7 +261,11 @@ fn build_table64(
         let local = handle.join().expect("worker thread panicked");
         merge_shards64(&mut global, local);
     }
-    Ok(global)
+    Ok(BuildResult64 {
+        table: global,
+        malformed_headers,
+        total_headers,
+    })
 }
 
 fn build_table32(
@@ -248,7 +274,7 @@ fn build_table32(
     shards: usize,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<Vec<NoHashMap32<GeneSet>>> {
+) -> io::Result<BuildResult32> {
     let (tx, rx) = bounded::<RefRecord>(threads * 4);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -259,10 +285,16 @@ fn build_table32(
     }
     drop(rx);
 
+    let mut malformed_headers = 0u64;
+    let mut total_headers = 0u64;
     read_fasta_records(path, |header, seq| {
         if !seq.is_empty() {
-            let gene_hash = parse_gene_hash(&header)?;
-            let _ = tx.send(RefRecord { gene_hash, seq });
+            total_headers += 1;
+            if let Some(gene_hash) = parse_gene_hash(&header) {
+                let _ = tx.send(RefRecord { gene_hash, seq });
+            } else {
+                malformed_headers += 1;
+            }
         }
         Ok(())
     })?;
@@ -273,7 +305,11 @@ fn build_table32(
         let local = handle.join().expect("worker thread panicked");
         merge_shards32(&mut global, local);
     }
-    Ok(global)
+    Ok(BuildResult32 {
+        table: global,
+        malformed_headers,
+        total_headers,
+    })
 }
 
 fn query_table64(
@@ -663,22 +699,11 @@ fn read_fasta_sequences<P: AsRef<Path>>(
     })
 }
 
-fn parse_gene_hash(header: &[u8]) -> io::Result<u64> {
+fn parse_gene_hash(header: &[u8]) -> Option<u64> {
     let mut fields = header.split(|&b| b == b'|');
     fields.next();
-    let gene = fields
-        .next()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "reference header does not have a non-empty second '|' field: {}",
-                    String::from_utf8_lossy(header)
-                ),
-            )
-        })?;
-    Ok(xxh3_64(gene))
+    let gene = fields.next().filter(|field| !field.is_empty())?;
+    Some(xxh3_64(gene))
 }
 
 #[inline(always)]
@@ -1304,6 +1329,21 @@ fn print_indexed_gene_stats(multi_kmers: u64, total_kmers: u64) {
         format_u64_commas(multi_kmers),
         multi_kmer_pct,
         format_u64_commas(total_kmers)
+    );
+}
+
+fn print_header_parse_stats(malformed_headers: u64, total_headers: u64) {
+    let malformed_pct = if total_headers == 0 {
+        0.0
+    } else {
+        (malformed_headers as f64) * 100.0 / (total_headers as f64)
+    };
+
+    println!(
+        "reference_headers_wrongly_parsed\t{} ({:.2}% of {})",
+        format_u64_commas(malformed_headers),
+        malformed_pct,
+        format_u64_commas(total_headers)
     );
 }
 
