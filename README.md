@@ -1,6 +1,6 @@
 # Sid
 
-Fast k-mer membership for FASTA files with sharded hash tables, optional gapped k-mers, and canonicalization (min of forward and reverse-complement).
+Fast k-mer membership for FASTA files with sharded hash tables, optional gapped k-mers, canonicalization (min of forward and reverse-complement), and gene-aware reference indexing.
 
 ## Build
 
@@ -18,8 +18,10 @@ The binary will be at `target/release/Sid`.
 
 The program:
 - Indexes all k-mers from the reference into sharded hash tables.
+- Tracks which reference genes each indexed k-mer was seen in by hashing the second `|`-delimited FASTA header field to `u64`.
+- Reports how many indexed k-mers are shared across multiple genes.
 - Scans the query and counts how many of its k-mers are present.
-- Reports total matching k-mer windows and the number of query sequences with at least one hit.
+- Reports total matching k-mer windows, how many query k-mers map to multiple genes, how many query sequences have any hit, and how many query sequences remain multi-gene when classified by their most specific matched k-mer.
 
 ## Options
 
@@ -70,11 +72,14 @@ Example FASTA files are provided in `examples/`.
 
 ## Output
 
-Two tab-separated lines:
+Five tab-separated lines:
 
 ```
+indexed_kmers_multiple_genes\t<COUNT> (<PERCENT>% of <TOTAL_UNIQUE_INDEXED_KMERS>)
 query_kmer_hits\t<COUNT> (<PERCENT>% of <TOTAL>)
+query_kmers_multiple_genes\t<COUNT> (<PERCENT>% of <TOTAL>)
 query_sequences_with_hit\t<COUNT> (<PERCENT>% of <TOTAL>)
+query_sequences_multiple_genes\t<COUNT> (<PERCENT>% of <TOTAL>)
 ```
 
 Counts include comma separators for readability.
@@ -82,6 +87,8 @@ Counts include comma separators for readability.
 ## Notes
 
 - FASTA only. Headers are lines starting with `>`.
+- Reference FASTA headers must have a gene identifier in the second `|`-delimited field, for example `>ENST...|ENSG...|...`.
 - Gaps are randomly chosen per pattern, but never in positions 0..7.
 - For `k <= 32` without gaps, hashing uses a fast 2-bit rolling encoder.
 - For `k > 32` or gapped k-mers with more than 32 kept positions, hashing uses `xxh3` on the compacted sequence.
+- Query sequences are classified by the smallest gene-set size among their matched k-mers; if that smallest set still contains multiple genes, the sequence is reported as multi-gene.

@@ -1,21 +1,21 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver};
-use hashbrown::HashSet;
+use crossbeam_channel::{Receiver, bounded};
+use hashbrown::{HashMap, hash_map::Entry};
 use nohash_hasher::BuildNoHashHasher;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use xxhash_rust::xxh3::xxh3_64;
 
-type NoHashSet64 = HashSet<u64, BuildNoHashHasher<u64>>;
-type NoHashSet32 = HashSet<u32, BuildNoHashHasher<u32>>;
+type NoHashMap64<V> = HashMap<u64, V, BuildNoHashHasher<u64>>;
+type NoHashMap32<V> = HashMap<u32, V, BuildNoHashHasher<u32>>;
 
 const K_MIX: u64 = 0x9e3779b97f4a7c15;
 
@@ -56,6 +56,71 @@ struct GappedMask {
     gap_positions: Vec<usize>,
 }
 
+struct RefRecord {
+    gene_hash: u64,
+    seq: Vec<u8>,
+}
+
+struct QueryStats {
+    hits: u64,
+    multi_gene_hits: u64,
+    seq_hits: u64,
+    multi_gene_seqs: u64,
+    total_kmers: u64,
+    total_seqs: u64,
+}
+
+struct QuerySequenceStats {
+    hits: u64,
+    multi_gene_hits: u64,
+    total: u64,
+    best_gene_count: Option<usize>,
+}
+
+enum GeneSet {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl GeneSet {
+    fn new(gene_hash: u64) -> Self {
+        Self::One(gene_hash)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(genes) => genes.len(),
+        }
+    }
+
+    fn insert(&mut self, gene_hash: u64) {
+        match self {
+            Self::One(existing) => {
+                if *existing != gene_hash {
+                    *self = Self::Many(vec![*existing, gene_hash]);
+                }
+            }
+            Self::Many(genes) => {
+                if !genes.contains(&gene_hash) {
+                    genes.push(gene_hash);
+                }
+            }
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        match other {
+            Self::One(gene_hash) => self.insert(gene_hash),
+            Self::Many(genes) => {
+                for gene_hash in genes {
+                    self.insert(gene_hash);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
     if args.k == 0 {
@@ -69,9 +134,7 @@ fn main() -> io::Result<()> {
     if args.gaps > 0 {
         let allowed = args.k.saturating_sub(8);
         if args.gaps > allowed {
-            eprintln!(
-                "Error: --gaps must be <= k-8 (no gaps allowed in the first 8 positions)"
-            );
+            eprintln!("Error: --gaps must be <= k-8 (no gaps allowed in the first 8 positions)");
             std::process::exit(2);
         }
     }
@@ -115,19 +178,31 @@ fn main() -> io::Result<()> {
     }
 
     if args.hash32 {
-        let table =
-            build_table32(&args.reference, Arc::clone(&masks), args.shards, shard_bits, threads)?;
+        let table = build_table32(
+            &args.reference,
+            Arc::clone(&masks),
+            args.shards,
+            shard_bits,
+            threads,
+        )?;
+        let (multi_kmers, total_kmers) = indexed_gene_stats32(&table);
+        print_indexed_gene_stats(multi_kmers, total_kmers);
         let table = Arc::new(table);
-        let (hits, seqs, total_kmers, total_seqs) =
-            query_table32(&args.query, table, masks, shard_bits, threads)?;
-        print_stats(hits, total_kmers, seqs, total_seqs);
+        let stats = query_table32(&args.query, table, masks, shard_bits, threads)?;
+        print_query_stats(&stats);
     } else {
-        let table =
-            build_table64(&args.reference, Arc::clone(&masks), args.shards, shard_bits, threads)?;
+        let table = build_table64(
+            &args.reference,
+            Arc::clone(&masks),
+            args.shards,
+            shard_bits,
+            threads,
+        )?;
+        let (multi_kmers, total_kmers) = indexed_gene_stats64(&table);
+        print_indexed_gene_stats(multi_kmers, total_kmers);
         let table = Arc::new(table);
-        let (hits, seqs, total_kmers, total_seqs) =
-            query_table64(&args.query, table, masks, shard_bits, threads)?;
-        print_stats(hits, total_kmers, seqs, total_seqs);
+        let stats = query_table64(&args.query, table, masks, shard_bits, threads)?;
+        print_query_stats(&stats);
     }
 
     Ok(())
@@ -139,8 +214,8 @@ fn build_table64(
     shards: usize,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<Vec<NoHashSet64>> {
-    let (tx, rx) = bounded::<Vec<u8>>(threads * 4);
+) -> io::Result<Vec<NoHashMap64<GeneSet>>> {
+    let (tx, rx) = bounded::<RefRecord>(threads * 4);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let rx = rx.clone();
@@ -150,10 +225,12 @@ fn build_table64(
     }
     drop(rx);
 
-    read_fasta_sequences(path, |seq| {
+    read_fasta_records(path, |header, seq| {
         if !seq.is_empty() {
-            let _ = tx.send(seq);
+            let gene_hash = parse_gene_hash(&header)?;
+            let _ = tx.send(RefRecord { gene_hash, seq });
         }
+        Ok(())
     })?;
     drop(tx);
 
@@ -171,8 +248,8 @@ fn build_table32(
     shards: usize,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<Vec<NoHashSet32>> {
-    let (tx, rx) = bounded::<Vec<u8>>(threads * 4);
+) -> io::Result<Vec<NoHashMap32<GeneSet>>> {
+    let (tx, rx) = bounded::<RefRecord>(threads * 4);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let rx = rx.clone();
@@ -182,10 +259,12 @@ fn build_table32(
     }
     drop(rx);
 
-    read_fasta_sequences(path, |seq| {
+    read_fasta_records(path, |header, seq| {
         if !seq.is_empty() {
-            let _ = tx.send(seq);
+            let gene_hash = parse_gene_hash(&header)?;
+            let _ = tx.send(RefRecord { gene_hash, seq });
         }
+        Ok(())
     })?;
     drop(tx);
 
@@ -199,14 +278,16 @@ fn build_table32(
 
 fn query_table64(
     path: &Path,
-    table: Arc<Vec<NoHashSet64>>,
+    table: Arc<Vec<NoHashMap64<GeneSet>>>,
     masks: Arc<Vec<GappedMask>>,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<(u64, u64, u64, u64)> {
+) -> io::Result<QueryStats> {
     let (tx, rx) = bounded::<Vec<u8>>(threads * 4);
     let total_hits = Arc::new(AtomicU64::new(0));
+    let total_multi_gene_hits = Arc::new(AtomicU64::new(0));
     let seq_hits = Arc::new(AtomicU64::new(0));
+    let multi_gene_seqs = Arc::new(AtomicU64::new(0));
     let total_kmers = Arc::new(AtomicU64::new(0));
     let total_seqs = Arc::new(AtomicU64::new(0));
 
@@ -216,7 +297,9 @@ fn query_table64(
         let table = Arc::clone(&table);
         let masks = Arc::clone(&masks);
         let total_hits = Arc::clone(&total_hits);
+        let total_multi_gene_hits = Arc::clone(&total_multi_gene_hits);
         let seq_hits = Arc::clone(&seq_hits);
+        let multi_gene_seqs = Arc::clone(&multi_gene_seqs);
         let total_kmers = Arc::clone(&total_kmers);
         let total_seqs = Arc::clone(&total_seqs);
         let handle = thread::spawn(move || {
@@ -226,7 +309,9 @@ fn query_table64(
                 &masks,
                 shard_bits,
                 &total_hits,
+                &total_multi_gene_hits,
                 &seq_hits,
+                &multi_gene_seqs,
                 &total_kmers,
                 &total_seqs,
             )
@@ -246,24 +331,28 @@ fn query_table64(
         handle.join().expect("worker thread panicked");
     }
 
-    Ok((
-        total_hits.load(Ordering::Relaxed),
-        seq_hits.load(Ordering::Relaxed),
-        total_kmers.load(Ordering::Relaxed),
-        total_seqs.load(Ordering::Relaxed),
-    ))
+    Ok(QueryStats {
+        hits: total_hits.load(Ordering::Relaxed),
+        multi_gene_hits: total_multi_gene_hits.load(Ordering::Relaxed),
+        seq_hits: seq_hits.load(Ordering::Relaxed),
+        multi_gene_seqs: multi_gene_seqs.load(Ordering::Relaxed),
+        total_kmers: total_kmers.load(Ordering::Relaxed),
+        total_seqs: total_seqs.load(Ordering::Relaxed),
+    })
 }
 
 fn query_table32(
     path: &Path,
-    table: Arc<Vec<NoHashSet32>>,
+    table: Arc<Vec<NoHashMap32<GeneSet>>>,
     masks: Arc<Vec<GappedMask>>,
     shard_bits: u32,
     threads: usize,
-) -> io::Result<(u64, u64, u64, u64)> {
+) -> io::Result<QueryStats> {
     let (tx, rx) = bounded::<Vec<u8>>(threads * 4);
     let total_hits = Arc::new(AtomicU64::new(0));
+    let total_multi_gene_hits = Arc::new(AtomicU64::new(0));
     let seq_hits = Arc::new(AtomicU64::new(0));
+    let multi_gene_seqs = Arc::new(AtomicU64::new(0));
     let total_kmers = Arc::new(AtomicU64::new(0));
     let total_seqs = Arc::new(AtomicU64::new(0));
 
@@ -273,7 +362,9 @@ fn query_table32(
         let table = Arc::clone(&table);
         let masks = Arc::clone(&masks);
         let total_hits = Arc::clone(&total_hits);
+        let total_multi_gene_hits = Arc::clone(&total_multi_gene_hits);
         let seq_hits = Arc::clone(&seq_hits);
+        let multi_gene_seqs = Arc::clone(&multi_gene_seqs);
         let total_kmers = Arc::clone(&total_kmers);
         let total_seqs = Arc::clone(&total_seqs);
         let handle = thread::spawn(move || {
@@ -283,7 +374,9 @@ fn query_table32(
                 &masks,
                 shard_bits,
                 &total_hits,
+                &total_multi_gene_hits,
                 &seq_hits,
+                &multi_gene_seqs,
                 &total_kmers,
                 &total_seqs,
             )
@@ -303,34 +396,44 @@ fn query_table32(
         handle.join().expect("worker thread panicked");
     }
 
-    Ok((
-        total_hits.load(Ordering::Relaxed),
-        seq_hits.load(Ordering::Relaxed),
-        total_kmers.load(Ordering::Relaxed),
-        total_seqs.load(Ordering::Relaxed),
-    ))
+    Ok(QueryStats {
+        hits: total_hits.load(Ordering::Relaxed),
+        multi_gene_hits: total_multi_gene_hits.load(Ordering::Relaxed),
+        seq_hits: seq_hits.load(Ordering::Relaxed),
+        multi_gene_seqs: multi_gene_seqs.load(Ordering::Relaxed),
+        total_kmers: total_kmers.load(Ordering::Relaxed),
+        total_seqs: total_seqs.load(Ordering::Relaxed),
+    })
 }
 
 fn build_worker64(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<RefRecord>,
     masks: &[GappedMask],
     shards: usize,
     shard_bits: u32,
-) -> Vec<NoHashSet64> {
+) -> Vec<NoHashMap64<GeneSet>> {
     let mut local = make_shards64(shards);
     if masks.len() == 1 {
         let mask = &masks[0];
-        for seq in rx {
-            for_each_hash64(&seq, mask, |h| {
+        for record in rx {
+            let gene_hash = record.gene_hash;
+            for_each_hash64(&record.seq, mask, |h| {
                 let idx = shard_index64(h, shard_bits);
-                local[idx].insert(h);
+                local[idx]
+                    .entry(h)
+                    .and_modify(|genes| genes.insert(gene_hash))
+                    .or_insert_with(|| GeneSet::new(gene_hash));
             });
         }
     } else {
-        for seq in rx {
-            for_each_hash_multi64(&seq, masks, |h| {
+        for record in rx {
+            let gene_hash = record.gene_hash;
+            for_each_hash_multi64(&record.seq, masks, |h| {
                 let idx = shard_index64(h, shard_bits);
-                local[idx].insert(h);
+                local[idx]
+                    .entry(h)
+                    .and_modify(|genes| genes.insert(gene_hash))
+                    .or_insert_with(|| GeneSet::new(gene_hash));
             });
         }
     }
@@ -338,25 +441,33 @@ fn build_worker64(
 }
 
 fn build_worker32(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<RefRecord>,
     masks: &[GappedMask],
     shards: usize,
     shard_bits: u32,
-) -> Vec<NoHashSet32> {
+) -> Vec<NoHashMap32<GeneSet>> {
     let mut local = make_shards32(shards);
     if masks.len() == 1 {
         let mask = &masks[0];
-        for seq in rx {
-            for_each_hash32(&seq, mask, |h| {
+        for record in rx {
+            let gene_hash = record.gene_hash;
+            for_each_hash32(&record.seq, mask, |h| {
                 let idx = shard_index32(h, shard_bits);
-                local[idx].insert(h);
+                local[idx]
+                    .entry(h)
+                    .and_modify(|genes| genes.insert(gene_hash))
+                    .or_insert_with(|| GeneSet::new(gene_hash));
             });
         }
     } else {
-        for seq in rx {
-            for_each_hash_multi32(&seq, masks, |h| {
+        for record in rx {
+            let gene_hash = record.gene_hash;
+            for_each_hash_multi32(&record.seq, masks, |h| {
                 let idx = shard_index32(h, shard_bits);
-                local[idx].insert(h);
+                local[idx]
+                    .entry(h)
+                    .and_modify(|genes| genes.insert(gene_hash))
+                    .or_insert_with(|| GeneSet::new(gene_hash));
             });
         }
     }
@@ -365,16 +476,20 @@ fn build_worker32(
 
 fn query_worker64(
     rx: Receiver<Vec<u8>>,
-    table: &[NoHashSet64],
+    table: &[NoHashMap64<GeneSet>],
     masks: &[GappedMask],
     shard_bits: u32,
     total_hits: &AtomicU64,
+    total_multi_gene_hits: &AtomicU64,
     seq_hits: &AtomicU64,
+    multi_gene_seqs: &AtomicU64,
     total_kmers: &AtomicU64,
     total_seqs: &AtomicU64,
 ) {
     let mut local_hits = 0u64;
+    let mut local_multi_gene_hits = 0u64;
     let mut local_seq_hits = 0u64;
+    let mut local_multi_gene_seqs = 0u64;
     let mut local_total_kmers = 0u64;
     let mut local_total_seqs = 0u64;
     if masks.len() == 1 {
@@ -382,49 +497,70 @@ fn query_worker64(
         for seq in rx {
             local_total_seqs += 1;
             let mut hits = 0u64;
+            let mut multi_gene_hits = 0u64;
             let mut total = 0u64;
+            let mut best_gene_count: Option<usize> = None;
             for_each_hash64(&seq, mask, |h| {
                 total += 1;
                 let idx = shard_index64(h, shard_bits);
-                if table[idx].contains(&h) {
+                if let Some(genes) = table[idx].get(&h) {
                     hits += 1;
+                    if genes.len() > 1 {
+                        multi_gene_hits += 1;
+                    }
+                    best_gene_count =
+                        Some(best_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())));
                 }
             });
             local_total_kmers += total;
             if hits > 0 {
                 local_hits += hits;
+                local_multi_gene_hits += multi_gene_hits;
                 local_seq_hits += 1;
+            }
+            if matches!(best_gene_count, Some(count) if count > 1) {
+                local_multi_gene_seqs += 1;
             }
         }
     } else {
         for seq in rx {
             local_total_seqs += 1;
-            let (hits, total) = query_multi64(&seq, masks, table, shard_bits);
-            local_total_kmers += total;
-            if hits > 0 {
-                local_hits += hits;
+            let stats = query_multi64(&seq, masks, table, shard_bits);
+            local_total_kmers += stats.total;
+            if stats.hits > 0 {
+                local_hits += stats.hits;
+                local_multi_gene_hits += stats.multi_gene_hits;
                 local_seq_hits += 1;
+            }
+            if matches!(stats.best_gene_count, Some(count) if count > 1) {
+                local_multi_gene_seqs += 1;
             }
         }
     }
     total_hits.fetch_add(local_hits, Ordering::Relaxed);
+    total_multi_gene_hits.fetch_add(local_multi_gene_hits, Ordering::Relaxed);
     seq_hits.fetch_add(local_seq_hits, Ordering::Relaxed);
+    multi_gene_seqs.fetch_add(local_multi_gene_seqs, Ordering::Relaxed);
     total_kmers.fetch_add(local_total_kmers, Ordering::Relaxed);
     total_seqs.fetch_add(local_total_seqs, Ordering::Relaxed);
 }
 
 fn query_worker32(
     rx: Receiver<Vec<u8>>,
-    table: &[NoHashSet32],
+    table: &[NoHashMap32<GeneSet>],
     masks: &[GappedMask],
     shard_bits: u32,
     total_hits: &AtomicU64,
+    total_multi_gene_hits: &AtomicU64,
     seq_hits: &AtomicU64,
+    multi_gene_seqs: &AtomicU64,
     total_kmers: &AtomicU64,
     total_seqs: &AtomicU64,
 ) {
     let mut local_hits = 0u64;
+    let mut local_multi_gene_hits = 0u64;
     let mut local_seq_hits = 0u64;
+    let mut local_multi_gene_seqs = 0u64;
     let mut local_total_kmers = 0u64;
     let mut local_total_seqs = 0u64;
     if masks.len() == 1 {
@@ -432,44 +568,62 @@ fn query_worker32(
         for seq in rx {
             local_total_seqs += 1;
             let mut hits = 0u64;
+            let mut multi_gene_hits = 0u64;
             let mut total = 0u64;
+            let mut best_gene_count: Option<usize> = None;
             for_each_hash32(&seq, mask, |h| {
                 total += 1;
                 let idx = shard_index32(h, shard_bits);
-                if table[idx].contains(&h) {
+                if let Some(genes) = table[idx].get(&h) {
                     hits += 1;
+                    if genes.len() > 1 {
+                        multi_gene_hits += 1;
+                    }
+                    best_gene_count =
+                        Some(best_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())));
                 }
             });
             local_total_kmers += total;
             if hits > 0 {
                 local_hits += hits;
+                local_multi_gene_hits += multi_gene_hits;
                 local_seq_hits += 1;
+            }
+            if matches!(best_gene_count, Some(count) if count > 1) {
+                local_multi_gene_seqs += 1;
             }
         }
     } else {
         for seq in rx {
             local_total_seqs += 1;
-            let (hits, total) = query_multi32(&seq, masks, table, shard_bits);
-            local_total_kmers += total;
-            if hits > 0 {
-                local_hits += hits;
+            let stats = query_multi32(&seq, masks, table, shard_bits);
+            local_total_kmers += stats.total;
+            if stats.hits > 0 {
+                local_hits += stats.hits;
+                local_multi_gene_hits += stats.multi_gene_hits;
                 local_seq_hits += 1;
+            }
+            if matches!(stats.best_gene_count, Some(count) if count > 1) {
+                local_multi_gene_seqs += 1;
             }
         }
     }
     total_hits.fetch_add(local_hits, Ordering::Relaxed);
+    total_multi_gene_hits.fetch_add(local_multi_gene_hits, Ordering::Relaxed);
     seq_hits.fetch_add(local_seq_hits, Ordering::Relaxed);
+    multi_gene_seqs.fetch_add(local_multi_gene_seqs, Ordering::Relaxed);
     total_kmers.fetch_add(local_total_kmers, Ordering::Relaxed);
     total_seqs.fetch_add(local_total_seqs, Ordering::Relaxed);
 }
 
-fn read_fasta_sequences<P: AsRef<Path>>(
+fn read_fasta_records<P: AsRef<Path>>(
     path: P,
-    mut on_seq: impl FnMut(Vec<u8>),
+    mut on_record: impl FnMut(Vec<u8>, Vec<u8>) -> io::Result<()>,
 ) -> io::Result<()> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut line = Vec::new();
+    let mut header = Vec::new();
     let mut seq = Vec::new();
 
     loop {
@@ -485,17 +639,46 @@ fn read_fasta_sequences<P: AsRef<Path>>(
             continue;
         }
         if line[0] == b'>' {
-            if !seq.is_empty() {
-                on_seq(std::mem::take(&mut seq));
+            if !header.is_empty() || !seq.is_empty() {
+                on_record(std::mem::take(&mut header), std::mem::take(&mut seq))?;
             }
+            header.extend_from_slice(&line[1..]);
             continue;
         }
         seq.extend_from_slice(&line);
     }
-    if !seq.is_empty() {
-        on_seq(seq);
+    if !header.is_empty() || !seq.is_empty() {
+        on_record(header, seq)?;
     }
     Ok(())
+}
+
+fn read_fasta_sequences<P: AsRef<Path>>(
+    path: P,
+    mut on_seq: impl FnMut(Vec<u8>),
+) -> io::Result<()> {
+    read_fasta_records(path, |_, seq| {
+        on_seq(seq);
+        Ok(())
+    })
+}
+
+fn parse_gene_hash(header: &[u8]) -> io::Result<u64> {
+    let mut fields = header.split(|&b| b == b'|');
+    fields.next();
+    let gene = fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "reference header does not have a non-empty second '|' field: {}",
+                    String::from_utf8_lossy(header)
+                ),
+            )
+        })?;
+    Ok(xxh3_64(gene))
 }
 
 #[inline(always)]
@@ -816,15 +999,25 @@ fn for_each_hash_multi32(seq: &[u8], masks: &[GappedMask], mut f: impl FnMut(u32
 fn query_multi64(
     seq: &[u8],
     masks: &[GappedMask],
-    table: &[NoHashSet64],
+    table: &[NoHashMap64<GeneSet>],
     shard_bits: u32,
-) -> (u64, u64) {
+) -> QuerySequenceStats {
     if masks.is_empty() {
-        return (0, 0);
+        return QuerySequenceStats {
+            hits: 0,
+            multi_gene_hits: 0,
+            total: 0,
+            best_gene_count: None,
+        };
     }
     let k = masks[0].k;
     if k == 0 || seq.len() < k {
-        return (0, 0);
+        return QuerySequenceStats {
+            hits: 0,
+            multi_gene_hits: 0,
+            total: 0,
+            best_gene_count: None,
+        };
     }
     let mut buffers: Vec<Vec<u8>> = masks
         .iter()
@@ -839,10 +1032,12 @@ fn query_multi64(
         .collect();
 
     let mut hits = 0u64;
+    let mut multi_gene_hits = 0u64;
     let mut total = 0u64;
+    let mut best_gene_count: Option<usize> = None;
     for_each_canonical_window(seq, k, |canon| {
         total += 1;
-        let mut matched = false;
+        let mut best_window_gene_count: Option<usize> = None;
         for (mask, buf) in masks.iter().zip(buffers.iter_mut()) {
             let include = &mask.include;
             let mlen = include.len();
@@ -854,9 +1049,10 @@ fn query_multi64(
                 }
                 let h = mix64(val ^ K_MIX.wrapping_mul(mlen as u64));
                 let idx = shard_index64(h, shard_bits);
-                if table[idx].contains(&h) {
-                    matched = true;
-                    break;
+                if let Some(genes) = table[idx].get(&h) {
+                    best_window_gene_count = Some(
+                        best_window_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())),
+                    );
                 }
             } else {
                 for (j, &pos) in include.iter().enumerate() {
@@ -864,31 +1060,52 @@ fn query_multi64(
                 }
                 let h = xxh3_64(&buf);
                 let idx = shard_index64(h, shard_bits);
-                if table[idx].contains(&h) {
-                    matched = true;
-                    break;
+                if let Some(genes) = table[idx].get(&h) {
+                    best_window_gene_count = Some(
+                        best_window_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())),
+                    );
                 }
             }
         }
-        if matched {
+        if let Some(window_gene_count) = best_window_gene_count {
             hits += 1;
+            if window_gene_count > 1 {
+                multi_gene_hits += 1;
+            }
+            best_gene_count =
+                Some(best_gene_count.map_or(window_gene_count, |cur| cur.min(window_gene_count)));
         }
     });
-    (hits, total)
+    QuerySequenceStats {
+        hits,
+        multi_gene_hits,
+        total,
+        best_gene_count,
+    }
 }
 
 fn query_multi32(
     seq: &[u8],
     masks: &[GappedMask],
-    table: &[NoHashSet32],
+    table: &[NoHashMap32<GeneSet>],
     shard_bits: u32,
-) -> (u64, u64) {
+) -> QuerySequenceStats {
     if masks.is_empty() {
-        return (0, 0);
+        return QuerySequenceStats {
+            hits: 0,
+            multi_gene_hits: 0,
+            total: 0,
+            best_gene_count: None,
+        };
     }
     let k = masks[0].k;
     if k == 0 || seq.len() < k {
-        return (0, 0);
+        return QuerySequenceStats {
+            hits: 0,
+            multi_gene_hits: 0,
+            total: 0,
+            best_gene_count: None,
+        };
     }
     let mut buffers: Vec<Vec<u8>> = masks
         .iter()
@@ -903,10 +1120,12 @@ fn query_multi32(
         .collect();
 
     let mut hits = 0u64;
+    let mut multi_gene_hits = 0u64;
     let mut total = 0u64;
+    let mut best_gene_count: Option<usize> = None;
     for_each_canonical_window(seq, k, |canon| {
         total += 1;
-        let mut matched = false;
+        let mut best_window_gene_count: Option<usize> = None;
         for (mask, buf) in masks.iter().zip(buffers.iter_mut()) {
             let include = &mask.include;
             let mlen = include.len();
@@ -918,9 +1137,10 @@ fn query_multi32(
                 }
                 let h = mix64(val ^ K_MIX.wrapping_mul(mlen as u64)) as u32;
                 let idx = shard_index32(h, shard_bits);
-                if table[idx].contains(&h) {
-                    matched = true;
-                    break;
+                if let Some(genes) = table[idx].get(&h) {
+                    best_window_gene_count = Some(
+                        best_window_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())),
+                    );
                 }
             } else {
                 for (j, &pos) in include.iter().enumerate() {
@@ -928,17 +1148,28 @@ fn query_multi32(
                 }
                 let h = xxh3_64(&buf) as u32;
                 let idx = shard_index32(h, shard_bits);
-                if table[idx].contains(&h) {
-                    matched = true;
-                    break;
+                if let Some(genes) = table[idx].get(&h) {
+                    best_window_gene_count = Some(
+                        best_window_gene_count.map_or(genes.len(), |cur| cur.min(genes.len())),
+                    );
                 }
             }
         }
-        if matched {
+        if let Some(window_gene_count) = best_window_gene_count {
             hits += 1;
+            if window_gene_count > 1 {
+                multi_gene_hits += 1;
+            }
+            best_gene_count =
+                Some(best_gene_count.map_or(window_gene_count, |cur| cur.min(window_gene_count)));
         }
     });
-    (hits, total)
+    QuerySequenceStats {
+        hits,
+        multi_gene_hits,
+        total,
+        best_gene_count,
+    }
 }
 
 #[inline(always)]
@@ -959,10 +1190,10 @@ fn shard_index32(hash: u32, shard_bits: u32) -> usize {
     }
 }
 
-fn make_shards64(shards: usize) -> Vec<NoHashSet64> {
+fn make_shards64(shards: usize) -> Vec<NoHashMap64<GeneSet>> {
     let mut v = Vec::with_capacity(shards);
     for _ in 0..shards {
-        v.push(HashSet::with_capacity_and_hasher(
+        v.push(HashMap::with_capacity_and_hasher(
             0,
             BuildNoHashHasher::default(),
         ));
@@ -970,10 +1201,10 @@ fn make_shards64(shards: usize) -> Vec<NoHashSet64> {
     v
 }
 
-fn make_shards32(shards: usize) -> Vec<NoHashSet32> {
+fn make_shards32(shards: usize) -> Vec<NoHashMap32<GeneSet>> {
     let mut v = Vec::with_capacity(shards);
     for _ in 0..shards {
-        v.push(HashSet::with_capacity_and_hasher(
+        v.push(HashMap::with_capacity_and_hasher(
             0,
             BuildNoHashHasher::default(),
         ));
@@ -981,17 +1212,31 @@ fn make_shards32(shards: usize) -> Vec<NoHashSet32> {
     v
 }
 
-fn merge_shards64(global: &mut [NoHashSet64], mut local: Vec<NoHashSet64>) {
+fn merge_shards64(global: &mut [NoHashMap64<GeneSet>], mut local: Vec<NoHashMap64<GeneSet>>) {
     for (g, l) in global.iter_mut().zip(local.iter_mut()) {
         g.reserve(l.len());
-        g.extend(l.drain());
+        for (hash, genes) in l.drain() {
+            match g.entry(hash) {
+                Entry::Occupied(mut existing) => existing.get_mut().extend(genes),
+                Entry::Vacant(slot) => {
+                    slot.insert(genes);
+                }
+            }
+        }
     }
 }
 
-fn merge_shards32(global: &mut [NoHashSet32], mut local: Vec<NoHashSet32>) {
+fn merge_shards32(global: &mut [NoHashMap32<GeneSet>], mut local: Vec<NoHashMap32<GeneSet>>) {
     for (g, l) in global.iter_mut().zip(local.iter_mut()) {
         g.reserve(l.len());
-        g.extend(l.drain());
+        for (hash, genes) in l.drain() {
+            match g.entry(hash) {
+                Entry::Occupied(mut existing) => existing.get_mut().extend(genes),
+                Entry::Vacant(slot) => {
+                    slot.insert(genes);
+                }
+            }
+        }
     }
 }
 
@@ -1029,29 +1274,84 @@ fn make_gapped_masks(k: usize, gaps: usize, patterns: usize, seed: Option<u64>) 
     masks
 }
 
-fn print_stats(hits: u64, total_kmers: u64, seq_hits: u64, total_seqs: u64) {
-    let kmer_pct = if total_kmers == 0 {
+fn indexed_gene_stats64(table: &[NoHashMap64<GeneSet>]) -> (u64, u64) {
+    let total_kmers = table.iter().map(|shard| shard.len() as u64).sum();
+    let multi_kmers = table
+        .iter()
+        .map(|shard| shard.values().filter(|genes| genes.len() > 1).count() as u64)
+        .sum();
+    (multi_kmers, total_kmers)
+}
+
+fn indexed_gene_stats32(table: &[NoHashMap32<GeneSet>]) -> (u64, u64) {
+    let total_kmers = table.iter().map(|shard| shard.len() as u64).sum();
+    let multi_kmers = table
+        .iter()
+        .map(|shard| shard.values().filter(|genes| genes.len() > 1).count() as u64)
+        .sum();
+    (multi_kmers, total_kmers)
+}
+
+fn print_indexed_gene_stats(multi_kmers: u64, total_kmers: u64) {
+    let multi_kmer_pct = if total_kmers == 0 {
         0.0
     } else {
-        (hits as f64) * 100.0 / (total_kmers as f64)
+        (multi_kmers as f64) * 100.0 / (total_kmers as f64)
     };
-    let seq_pct = if total_seqs == 0 {
+
+    println!(
+        "indexed_kmers_multiple_genes\t{} ({:.2}% of {})",
+        format_u64_commas(multi_kmers),
+        multi_kmer_pct,
+        format_u64_commas(total_kmers)
+    );
+}
+
+fn print_query_stats(stats: &QueryStats) {
+    let kmer_pct = if stats.total_kmers == 0 {
         0.0
     } else {
-        (seq_hits as f64) * 100.0 / (total_seqs as f64)
+        (stats.hits as f64) * 100.0 / (stats.total_kmers as f64)
+    };
+    let multi_gene_kmer_pct = if stats.total_kmers == 0 {
+        0.0
+    } else {
+        (stats.multi_gene_hits as f64) * 100.0 / (stats.total_kmers as f64)
+    };
+    let seq_pct = if stats.total_seqs == 0 {
+        0.0
+    } else {
+        (stats.seq_hits as f64) * 100.0 / (stats.total_seqs as f64)
+    };
+    let multi_gene_seq_pct = if stats.total_seqs == 0 {
+        0.0
+    } else {
+        (stats.multi_gene_seqs as f64) * 100.0 / (stats.total_seqs as f64)
     };
 
     println!(
         "query_kmer_hits\t{} ({:.2}% of {})",
-        format_u64_commas(hits),
+        format_u64_commas(stats.hits),
         kmer_pct,
-        format_u64_commas(total_kmers)
+        format_u64_commas(stats.total_kmers)
+    );
+    println!(
+        "query_kmers_multiple_genes\t{} ({:.2}% of {})",
+        format_u64_commas(stats.multi_gene_hits),
+        multi_gene_kmer_pct,
+        format_u64_commas(stats.total_kmers)
     );
     println!(
         "query_sequences_with_hit\t{} ({:.2}% of {})",
-        format_u64_commas(seq_hits),
+        format_u64_commas(stats.seq_hits),
         seq_pct,
-        format_u64_commas(total_seqs)
+        format_u64_commas(stats.total_seqs)
+    );
+    println!(
+        "query_sequences_multiple_genes\t{} ({:.2}% of {})",
+        format_u64_commas(stats.multi_gene_seqs),
+        multi_gene_seq_pct,
+        format_u64_commas(stats.total_seqs)
     );
 }
 
